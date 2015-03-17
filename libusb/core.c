@@ -5,6 +5,12 @@
  * Copyright © 2007-2008 Daniel Drake <dsd@gentoo.org>
  * Copyright © 2001 Johannes Erdfelt <johannes@erdfelt.com>
  *
+ *  Modified 2014 Martin Marinov <martintzvetomirov@gmail.com>
+ *  - Added function open2 to open a devce from an existing file
+ *  descriptor
+ *  - Added function init2 to init libusb context from a given file path
+ *
+ *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
@@ -1125,13 +1131,69 @@ int API_EXPORTED libusb_open(libusb_device *dev,
 	usbi_mutex_unlock(&ctx->open_devs_lock);
 	*handle = _handle;
 
-	/* At this point, we want to interrupt any existing event handlers so
-	 * that they realise the addition of the new device's poll fd. One
-	 * example when this is desirable is if the user is running a separate
-	 * dedicated libusb events handling thread, which is running with a long
-	 * or infinite timeout. We want to interrupt that iteration of the loop,
-	 * so that it picks up the new fd, and then continues. */
-	usbi_fd_notification(ctx);
+	if (usbi_backend->caps & USBI_CAP_HAS_POLLABLE_DEVICE_FD) {
+		/* At this point, we want to interrupt any existing event handlers so
+		 * that they realise the addition of the new device's poll fd. One
+		 * example when this is desirable is if the user is running a separate
+		 * dedicated libusb events handling thread, which is running with a long
+		 * or infinite timeout. We want to interrupt that iteration of the loop,
+		 * so that it picks up the new fd, and then continues. */
+		usbi_fd_notification(ctx);
+	}
+
+	return 0;
+}
+
+int API_EXPORTED libusb_open2(libusb_device *dev, libusb_device_handle **handle, int fd)
+{
+	struct libusb_context *ctx = DEVICE_CTX(dev);
+	struct libusb_device_handle *_handle;
+	size_t priv_size = usbi_backend->device_handle_priv_size;
+	int r;
+	usbi_dbg("open %d.%d", dev->bus_number, dev->device_address);
+
+	if (!dev->attached) {
+		return LIBUSB_ERROR_NO_DEVICE;
+	}
+
+	_handle = malloc(sizeof(*_handle) + priv_size);
+	if (!_handle)
+		return LIBUSB_ERROR_NO_MEM;
+
+	r = usbi_mutex_init(&_handle->lock, NULL);
+	if (r) {
+		free(_handle);
+		return LIBUSB_ERROR_OTHER;
+	}
+
+	_handle->dev = libusb_ref_device(dev);
+	_handle->auto_detach_kernel_driver = 0;
+	_handle->claimed_interfaces = 0;
+	memset(&_handle->os_priv, 0, priv_size);
+
+	r = usbi_backend->open2(_handle, fd);
+	if (r < 0) {
+		usbi_dbg("open %d.%d returns %d", dev->bus_number, dev->device_address, r);
+		libusb_unref_device(dev);
+		usbi_mutex_destroy(&_handle->lock);
+		free(_handle);
+		return r;
+	}
+
+	usbi_mutex_lock(&ctx->open_devs_lock);
+	list_add(&_handle->list, &ctx->open_devs);
+	usbi_mutex_unlock(&ctx->open_devs_lock);
+	*handle = _handle;
+
+	if (usbi_backend->caps & USBI_CAP_HAS_POLLABLE_DEVICE_FD) {
+		/* At this point, we want to interrupt any existing event handlers so
+		 * that they realise the addition of the new device's poll fd. One
+		 * example when this is desirable is if the user is running a separate
+		 * dedicated libusb events handling thread, which is running with a long
+		 * or infinite timeout. We want to interrupt that iteration of the loop,
+		 * so that it picks up the new fd, and then continues. */
+		usbi_fd_notification(ctx);
+	}
 
 	return 0;
 }
@@ -1850,6 +1912,115 @@ void API_EXPORTED libusb_set_debug(libusb_context *ctx, int level)
 		ctx->debug = level;
 }
 
+int API_EXPORTED libusb_init2(libusb_context **context, const char * uspfs_path_input)
+{
+	struct libusb_device *dev, *next;
+	char *dbg = getenv("LIBUSB_DEBUG");
+	struct libusb_context *ctx;
+	static int first_init = 1;
+	int r = 0;
+
+	usbi_mutex_static_lock(&default_context_lock);
+
+	if (!timestamp_origin.tv_sec) {
+		usbi_gettimeofday(&timestamp_origin, NULL);
+	}
+
+	if (!context && usbi_default_context) {
+		usbi_dbg("reusing default context");
+		default_context_refcnt++;
+		usbi_mutex_static_unlock(&default_context_lock);
+		return 0;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		r = LIBUSB_ERROR_NO_MEM;
+		goto err_unlock;
+	}
+
+#ifdef ENABLE_DEBUG_LOGGING
+	ctx->debug = LIBUSB_LOG_LEVEL_DEBUG;
+#endif
+
+	if (dbg) {
+		ctx->debug = atoi(dbg);
+		if (ctx->debug)
+			ctx->debug_fixed = 1;
+	}
+
+	/* default context should be initialized before calling usbi_dbg */
+	if (!usbi_default_context) {
+		usbi_default_context = ctx;
+		default_context_refcnt++;
+		usbi_dbg("created default context");
+	}
+
+	usbi_dbg("libusb v%d.%d.%d.%d", libusb_version_internal.major, libusb_version_internal.minor,
+		libusb_version_internal.micro, libusb_version_internal.nano);
+
+	usbi_mutex_init(&ctx->usb_devs_lock, NULL);
+	usbi_mutex_init(&ctx->open_devs_lock, NULL);
+	usbi_mutex_init(&ctx->hotplug_cbs_lock, NULL);
+	list_init(&ctx->usb_devs);
+	list_init(&ctx->open_devs);
+	list_init(&ctx->hotplug_cbs);
+
+	usbi_mutex_static_lock(&active_contexts_lock);
+	if (first_init) {
+		first_init = 0;
+		list_init (&active_contexts_list);
+	}
+	list_add (&ctx->list, &active_contexts_list);
+	usbi_mutex_static_unlock(&active_contexts_lock);
+
+	if (usbi_backend->init2) {
+		r = usbi_backend->init2(ctx, uspfs_path_input);
+		if (r)
+			goto err_free_ctx;
+	}
+
+	r = usbi_io_init(ctx);
+	if (r < 0)
+		goto err_backend_exit;
+
+	usbi_mutex_static_unlock(&default_context_lock);
+
+	if (context)
+		*context = ctx;
+
+	return 0;
+
+err_backend_exit:
+	if (usbi_backend->exit)
+		usbi_backend->exit();
+err_free_ctx:
+	if (ctx == usbi_default_context) {
+		usbi_default_context = NULL;
+		default_context_refcnt--;
+	}
+
+	usbi_mutex_static_lock(&active_contexts_lock);
+	list_del (&ctx->list);
+	usbi_mutex_static_unlock(&active_contexts_lock);
+
+	usbi_mutex_lock(&ctx->usb_devs_lock);
+	list_for_each_entry_safe(dev, next, &ctx->usb_devs, list, struct libusb_device) {
+		list_del(&dev->list);
+		libusb_unref_device(dev);
+	}
+	usbi_mutex_unlock(&ctx->usb_devs_lock);
+
+	usbi_mutex_destroy(&ctx->open_devs_lock);
+	usbi_mutex_destroy(&ctx->usb_devs_lock);
+	usbi_mutex_destroy(&ctx->hotplug_cbs_lock);
+
+	free(ctx);
+err_unlock:
+	usbi_mutex_static_unlock(&default_context_lock);
+	return r;
+}
+
 /** \ingroup lib
  * Initialize libusb. This function must be called before calling any other
  * libusb function.
@@ -1946,8 +2117,10 @@ err_backend_exit:
 	if (usbi_backend->exit)
 		usbi_backend->exit();
 err_free_ctx:
-	if (ctx == usbi_default_context)
+	if (ctx == usbi_default_context) {
 		usbi_default_context = NULL;
+		default_context_refcnt--;
+	}
 
 	usbi_mutex_static_lock(&active_contexts_lock);
 	list_del (&ctx->list);

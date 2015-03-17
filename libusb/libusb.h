@@ -6,6 +6,12 @@
  * Copyright © 2012 Nathan Hjelm <hjelmn@cs.unm.edu>
  * For more information, please visit: http://libusb.info
  *
+ *  Modified 2014 Martin Marinov <martintzvetomirov@gmail.com>
+ *  - Added function open2 to open a devce from an existing file
+ *  descriptor
+ *  - Added function init2 to init libusb context from a given file path
+ *
+ *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
@@ -1304,6 +1310,7 @@ enum libusb_log_level {
 };
 
 int LIBUSB_CALL libusb_init(libusb_context **ctx);
+int LIBUSB_CALL libusb_init2(libusb_context **ctx, const char * uspfs_path_input);
 void LIBUSB_CALL libusb_exit(libusb_context *ctx);
 void LIBUSB_CALL libusb_set_debug(libusb_context *ctx, int level);
 const struct libusb_version * LIBUSB_CALL libusb_get_version(void);
@@ -1371,6 +1378,7 @@ int LIBUSB_CALL libusb_get_max_iso_packet_size(libusb_device *dev,
 	unsigned char endpoint);
 
 int LIBUSB_CALL libusb_open(libusb_device *dev, libusb_device_handle **handle);
+int LIBUSB_CALL libusb_open2(libusb_device *dev, libusb_device_handle **handle, int fd);
 void LIBUSB_CALL libusb_close(libusb_device_handle *dev_handle);
 libusb_device * LIBUSB_CALL libusb_get_device(libusb_device_handle *dev_handle);
 

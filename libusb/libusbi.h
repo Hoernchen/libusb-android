@@ -57,6 +57,7 @@
 /* Backend specific capabilities */
 #define USBI_CAP_HAS_HID_ACCESS					0x00010000
 #define USBI_CAP_SUPPORTS_DETACH_KERNEL_DRIVER	0x00020000
+#define USBI_CAP_HAS_POLLABLE_DEVICE_FD		0x00040000
 
 /* Maximum number of bytes in a log line */
 #define USBI_MAX_LOG_LEN	1024
@@ -228,6 +229,9 @@ static inline void usbi_dbg(const char *format, ...)
 
 extern struct libusb_context *usbi_default_context;
 
+/* Forward declaration for use in context (fully defined inside poll abstraction) */
+struct pollfd;
+
 struct libusb_context {
 	int debug;
 	int debug_fixed;
@@ -256,8 +260,13 @@ struct libusb_context {
 	struct list_head flying_transfers;
 	usbi_mutex_t flying_transfers_lock;
 
-	/* list of poll fds */
-	struct list_head pollfds;
+	/* list and count of poll fds and an array of poll fd structures that is
+	 * (re)allocated as necessary prior to polling, and a flag to indicate
+	 * when the list of poll fds has changed since the last poll. */
+	struct list_head ipollfds;
+	struct pollfd *pollfds;
+	POLL_NFDS_TYPE pollfds_cnt;
+	unsigned int pollfds_modified;
 	usbi_mutex_t pollfds_lock;
 
 	/* a counter that is set when we want to interrupt event handling, in order
@@ -520,6 +529,8 @@ struct usbi_os_backend {
 	 */
 	int (*init)(struct libusb_context *ctx);
 
+	int (*init2)(struct libusb_context *ctx, const char * uspfs_path_input);
+
 	/* Deinitialization. Optional. This function should destroy anything
 	 * that was set up by init.
 	 *
@@ -624,6 +635,8 @@ struct usbi_os_backend {
 	 * do this for you.
 	 */
 	int (*open)(struct libusb_device_handle *handle);
+
+	int (*open2)(struct libusb_device_handle *handle, int fd);
 
 	/* Close a device such that the handle cannot be used again. Your backend
 	 * should destroy any resources that were allocated in the open path.
