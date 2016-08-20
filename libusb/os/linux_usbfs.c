@@ -6,13 +6,6 @@
  * Copyright © 2013 Nathan Hjelm <hjelmn@mac.com>
  * Copyright © 2012-2013 Hans de Goede <hdegoede@redhat.com>
  *
- *  Modified 2014 Martin Marinov <martintzvetomirov@gmail.com>
- *  - Added function open2 to open a devce from an existing file
- *  descriptor
- *  - Added a quick fix for Android L by making irrelevant linux_netlink
- *  and find_usbfs_path
- *  - Added function init2 to init  from a known device path
- *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
@@ -48,6 +41,20 @@
 #include "libusb.h"
 #include "libusbi.h"
 #include "linux_usbfs.h"
+
+static openfunc myopen = open;
+static closefunc myclose = close;
+
+void usb_device_set_open_close_func(openfunc openf, closefunc closef){
+        myopen = open;
+        myclose = close;
+        if (openf){
+                myopen = openf;
+        }
+        if (closef){
+                myclose = closef;
+        }
+}
 
 /* sysfs vs usbfs:
  * opening a usbfs node causes the device to be resumed, so we attempt to
@@ -200,7 +207,7 @@ static int _get_usbfs_fd(struct libusb_device *dev, mode_t mode, int silent)
 		snprintf(path, PATH_MAX, "%s/%03d/%03d",
 			usbfs_path, dev->bus_number, dev->device_address);
 
-	fd = open(path, mode);
+        fd = myopen(path, mode);
 	if (fd != -1)
 		return fd; /* Success */
 
@@ -211,7 +218,7 @@ static int _get_usbfs_fd(struct libusb_device *dev, mode_t mode, int silent)
 		/* Wait 10ms for USB device path creation.*/
 		usleep(delay);
 
-		fd = open(path, mode);
+                fd = myopen(path, mode);
 		if (fd != -1)
 			return fd; /* Success */
 	}
@@ -284,36 +291,7 @@ static int check_usb_vfs(const char *dirname)
 
 static const char *find_usbfs_path(void)
 {
-	const char *path = "/dev/bus/usb";
-	const char *ret = NULL;
-
-	if (check_usb_vfs(path)) {
-		ret = path;
-	} else {
-		path = "/proc/bus/usb";
-		if (check_usb_vfs(path))
-			ret = path;
-	}
-
-	/* look for /dev/usbdev*.* if the normal places fail */
-	if (ret == NULL) {
-		struct dirent *entry;
-		DIR *dir;
-
-		path = "/dev";
-		dir = opendir(path);
-		if (dir != NULL) {
-			while ((entry = readdir(dir)) != NULL) {
-				if (_is_usbdev_entry(entry, NULL, NULL)) {
-					/* found one; that's enough */
-					ret = path;
-					usbdev_names = 1;
-					break;
-				}
-			}
-			closedir(dir);
-		}
-	}
+        const char *ret = "/dev/bus/usb";
 
 	if (ret != NULL)
 		usbi_dbg("found usbfs at %s", ret);
@@ -445,112 +423,8 @@ static int op_init(struct libusb_context *ctx)
 	usbi_mutex_static_lock(&linux_hotplug_startstop_lock);
 	r = LIBUSB_SUCCESS;
 	if (init_count == 0) {
-		/* start up hotplug event handler if supported */
-		int r = linux_start_event_monitor();
-		if (r != LIBUSB_SUCCESS)
-			usbi_err(ctx, "warning: error starting hotplug event monitor");
-	}
-	if (r == LIBUSB_SUCCESS) {
-		r = linux_scan_devices(ctx);
-		if (r == LIBUSB_SUCCESS)
-			init_count++;
-		else if (init_count == 0)
-			linux_stop_event_monitor();
-	} else
-		usbi_err(ctx, "error starting hotplug event monitor");
-	usbi_mutex_static_unlock(&linux_hotplug_startstop_lock);
-
-	return r;
-}
-
-static int op_init2(struct libusb_context *ctx, const char * uspfs_path_input)
-{
-	struct stat statbuf;
-	int r;
-
-	if (uspfs_path_input == NULL) {
-		return op_init(ctx);
-	}
-
-	const int strlenusbfs = strlen(uspfs_path_input);
-	if (strlenusbfs == 0) {
-		usbi_err(ctx, "usbfs not supplied");
-		return LIBUSB_ERROR_OTHER;
-	}
-
-	usbfs_path = malloc(strlenusbfs+1);
-
-	char * discarded_path = (char *) usbfs_path;
-	strcpy(discarded_path, uspfs_path_input);
-	discarded_path[strlenusbfs] = 0;
-
-	if (monotonic_clkid == -1)
-		monotonic_clkid = find_monotonic_clock();
-
-	if (supports_flag_bulk_continuation == -1) {
-		/* bulk continuation URB flag available from Linux 2.6.32 */
-		supports_flag_bulk_continuation = kernel_version_ge(2,6,32);
-		if (supports_flag_bulk_continuation == -1) {
-			usbi_err(ctx, "error checking for bulk continuation support");
-			return LIBUSB_ERROR_OTHER;
-		}
-	}
-
-	if (supports_flag_bulk_continuation)
-		usbi_dbg("bulk continuation flag supported");
-
-	if (-1 == supports_flag_zero_packet) {
-		/* zero length packet URB flag fixed since Linux 2.6.31 */
-		supports_flag_zero_packet = kernel_version_ge(2,6,31);
-		if (-1 == supports_flag_zero_packet) {
-			usbi_err(ctx, "error checking for zero length packet support");
-			return LIBUSB_ERROR_OTHER;
-		}
-	}
-
-	if (supports_flag_zero_packet)
-		usbi_dbg("zero length packet flag supported");
-
-	if (-1 == sysfs_has_descriptors) {
-		/* sysfs descriptors has all descriptors since Linux 2.6.26 */
-		sysfs_has_descriptors = kernel_version_ge(2,6,26);
-		if (-1 == sysfs_has_descriptors) {
-			usbi_err(ctx, "error checking for sysfs descriptors");
-			return LIBUSB_ERROR_OTHER;
-		}
-	}
-
-	if (-1 == sysfs_can_relate_devices) {
-		/* sysfs has busnum since Linux 2.6.22 */
-		sysfs_can_relate_devices = kernel_version_ge(2,6,22);
-		if (-1 == sysfs_can_relate_devices) {
-			usbi_err(ctx, "error checking for sysfs busnum");
-			return LIBUSB_ERROR_OTHER;
-		}
-	}
-
-	if (sysfs_can_relate_devices || sysfs_has_descriptors) {
-		r = stat(SYSFS_DEVICE_PATH, &statbuf);
-		if (r != 0 || !S_ISDIR(statbuf.st_mode)) {
-			usbi_warn(ctx, "sysfs not mounted");
-			sysfs_can_relate_devices = 0;
-			sysfs_has_descriptors = 0;
-		}
-	}
-
-	if (sysfs_can_relate_devices)
-		usbi_dbg("sysfs can relate devices");
-
-	if (sysfs_has_descriptors)
-		usbi_dbg("sysfs has complete descriptors");
-
-	usbi_mutex_static_lock(&linux_hotplug_startstop_lock);
-	r = LIBUSB_SUCCESS;
-	if (init_count == 0) {
-		/* start up hotplug event handler if supported */
-		int r = linux_start_event_monitor();
-		if (r != LIBUSB_SUCCESS)
-			usbi_err(ctx, "warning: error starting hotplug event monitor");
+		/* start up hotplug event handler */
+		r = linux_start_event_monitor();
 	}
 	if (r == LIBUSB_SUCCESS) {
 		r = linux_scan_devices(ctx);
@@ -581,7 +455,7 @@ static int linux_start_event_monitor(void)
 #if defined(USE_UDEV)
 	return linux_udev_start_event_monitor();
 #else
-	return linux_netlink_start_event_monitor();
+        return linux_netlink_start_event_monitor();
 #endif
 }
 
@@ -590,7 +464,7 @@ static int linux_stop_event_monitor(void)
 #if defined(USE_UDEV)
 	return linux_udev_stop_event_monitor();
 #else
-	return linux_netlink_stop_event_monitor();
+        return linux_netlink_stop_event_monitor();
 #endif
 }
 
@@ -616,7 +490,7 @@ static void op_hotplug_poll(void)
 #if defined(USE_UDEV)
 	linux_udev_hotplug_poll();
 #else
-	linux_netlink_hotplug_poll();
+        linux_netlink_hotplug_poll();
 #endif
 }
 
@@ -628,7 +502,7 @@ static int _open_sysfs_attr(struct libusb_device *dev, const char *attr)
 
 	snprintf(filename, PATH_MAX, "%s/%s/%s",
 		SYSFS_DEVICE_PATH, priv->sysfs_dir, attr);
-	fd = open(filename, O_RDONLY);
+        fd = myopen(filename, O_RDONLY);
 	if (fd < 0) {
 		usbi_err(DEVICE_CTX(dev),
 			"open %s failed ret=%d errno=%d", filename, fd, errno);
@@ -698,7 +572,7 @@ static int sysfs_get_active_config(struct libusb_device *dev, int *config)
 		return fd;
 
 	r = read(fd, tmp, sizeof(tmp));
-	close(fd);
+        myclose(fd);
 	if (r < 0) {
 		usbi_err(DEVICE_CTX(dev),
 			"read bConfigurationValue failed ret=%d errno=%d", r, errno);
@@ -1019,7 +893,7 @@ static int initialize_device(struct libusb_device *dev, uint8_t busnum,
 		priv->descriptors = usbi_reallocf(priv->descriptors,
 						  descriptors_size);
 		if (!priv->descriptors) {
-			close(fd);
+                        myclose(fd);
 			return LIBUSB_ERROR_NO_MEM;
 		}
 		/* usbfs has holes in the file */
@@ -1032,13 +906,13 @@ static int initialize_device(struct libusb_device *dev, uint8_t busnum,
 		if (r < 0) {
 			usbi_err(ctx, "read descriptor failed ret=%d errno=%d",
 				 fd, errno);
-			close(fd);
+                        myclose(fd);
 			return LIBUSB_ERROR_IO;
 		}
 		priv->descriptors_len += r;
 	} while (priv->descriptors_len == descriptors_size);
 
-	close(fd);
+        myclose(fd);
 
 	if (priv->descriptors_len < DEVICE_DESC_LENGTH) {
 		usbi_err(ctx, "short descriptor read (%d)",
@@ -1091,7 +965,7 @@ static int initialize_device(struct libusb_device *dev, uint8_t busnum,
 		r = LIBUSB_SUCCESS;
 	} /* else r < 0, just return the error code */
 
-	close(fd);
+        myclose(fd);
 	return r;
 }
 
@@ -1386,43 +1260,6 @@ static int linux_default_scan_devices (struct libusb_context *ctx)
 }
 #endif
 
-static int op_open2(struct libusb_device_handle *handle, int fd)
-{
-	struct linux_device_handle_priv *hpriv = _device_handle_priv(handle);
-	int r;
-
-	hpriv->fd = fd;
-	if (hpriv->fd < 0) {
-		if (hpriv->fd == LIBUSB_ERROR_NO_DEVICE) {
-			/* device will still be marked as attached if hotplug monitor thread
-			 * hasn't processed remove event yet */
-			usbi_mutex_static_lock(&linux_hotplug_lock);
-			if (handle->dev->attached) {
-				usbi_dbg("open failed with no device, but device still attached");
-				linux_device_disconnected(handle->dev->bus_number,
-						handle->dev->device_address, NULL);
-			}
-			usbi_mutex_static_unlock(&linux_hotplug_lock);
-		}
-		return hpriv->fd;
-	}
-
-	r = ioctl(hpriv->fd, IOCTL_USBFS_GET_CAPABILITIES, &hpriv->caps);
-	if (r < 0) {
-		if (errno == ENOTTY)
-			usbi_dbg("getcap not available");
-		else
-			usbi_err(HANDLE_CTX(handle), "getcap failed (%d)", errno);
-		hpriv->caps = 0;
-		if (supports_flag_zero_packet)
-			hpriv->caps |= USBFS_CAP_ZERO_PACKET;
-		if (supports_flag_bulk_continuation)
-			hpriv->caps |= USBFS_CAP_BULK_CONTINUATION;
-	}
-
-	return usbi_add_pollfd(HANDLE_CTX(handle), hpriv->fd, POLLOUT);
-}
-
 static int op_open(struct libusb_device_handle *handle)
 {
 	struct linux_device_handle_priv *hpriv = _device_handle_priv(handle);
@@ -1464,7 +1301,7 @@ static void op_close(struct libusb_device_handle *dev_handle)
 {
 	int fd = _device_handle_priv(dev_handle)->fd;
 	usbi_remove_pollfd(HANDLE_CTX(dev_handle), fd);
-	close(fd);
+        myclose(fd);
 }
 
 static int op_get_configuration(struct libusb_device_handle *handle,
@@ -2794,9 +2631,8 @@ static clockid_t op_get_timerfd_clockid(void)
 
 const struct usbi_os_backend linux_usbfs_backend = {
 	.name = "Linux usbfs",
-	.caps = USBI_CAP_HAS_HID_ACCESS|USBI_CAP_SUPPORTS_DETACH_KERNEL_DRIVER|USBI_CAP_HAS_POLLABLE_DEVICE_FD,
+	.caps = USBI_CAP_HAS_HID_ACCESS|USBI_CAP_SUPPORTS_DETACH_KERNEL_DRIVER,
 	.init = op_init,
-	.init2 = op_init2,
 	.exit = op_exit,
 	.get_device_list = NULL,
 	.hotplug_poll = op_hotplug_poll,
@@ -2806,7 +2642,6 @@ const struct usbi_os_backend linux_usbfs_backend = {
 	.get_config_descriptor_by_value = op_get_config_descriptor_by_value,
 
 	.open = op_open,
-	.open2 = op_open2,
 	.close = op_close,
 	.get_configuration = op_get_configuration,
 	.set_configuration = op_set_configuration,
